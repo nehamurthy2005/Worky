@@ -1,0 +1,91 @@
+-- Migration 002: Create all ENUM types
+
+CREATE TYPE user_role AS ENUM ('owner', 'employee');
+
+CREATE TYPE kyc_status AS ENUM (
+  'NOT_SUBMITTED',
+  'PENDING',
+  'APPROVED',
+  'REJECTED'
+);
+
+CREATE TYPE transaction_type AS ENUM (
+  'DEPOSIT',
+  'ESCROW_FREEZE',
+  'ESCROW_RELEASE',
+  'PAYMENT',
+  'WITHDRAWAL',
+  'REFUND',
+  'BOOST_FEE'
+);
+
+CREATE TYPE transaction_status AS ENUM (
+  'PENDING',
+  'COMPLETED',
+  'FAILED',
+  'REVERSED'
+);
+
+CREATE TYPE campaign_status AS ENUM (
+  'DRAFT',
+  'OPEN',
+  'IN_PROGRESS',
+  'SETTLING',
+  'SETTLED',
+  'CANCELLED'
+);
+
+CREATE TYPE escrow_status AS ENUM (
+  'NONE',
+  'FROZEN',
+  'PARTIAL_RELEASE',
+  'SETTLED',
+  'REFUNDED'
+);
+
+CREATE TYPE slot_status AS ENUM (
+  'AVAILABLE',
+  'APPLIED',
+  'ASSIGNED',
+  'COMPLETED',
+  'NO_SHOW',
+  'DISPUTED',
+  'CANCELLED'
+);
+
+CREATE TYPE application_status AS ENUM (
+  'PENDING',
+  'ACCEPTED',
+  'REJECTED',
+  'WITHDRAWN'
+);
+
+CREATE TYPE withdrawal_status AS ENUM (
+  'PENDING',
+  'PROCESSING',
+  'COMPLETED',
+  'FAILED',
+  'CANCELLED'
+);
+
+CREATE TYPE dispute_status AS ENUM (
+  'OPEN',
+  'UNDER_REVIEW',
+  'RESOLVED_OWNER',
+  'RESOLVED_EMPLOYEE',
+  'CLOSED'
+);
+
+CREATE TYPE boost_tier AS ENUM ('BASIC', 'STANDARD', 'PREMIUM');
+
+CREATE TYPE notification_type AS ENUM (
+  'APPLICATION_RECEIVED',
+  'APPLICATION_ACCEPTED',
+  'APPLICATION_REJECTED',
+  'WORK_APPROVED',
+  'PAYMENT_RECEIVED',
+  'WITHDRAWAL_PROCESSED',
+  'DISPUTE_UPDATE',
+  'CAMPAIGN_UPDATE',
+  'SYSTEM'
+);
