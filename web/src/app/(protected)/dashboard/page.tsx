@@ -1,49 +1,30 @@
 import { redirect } from "next/navigation";
 import Link from "next/link";
-import { createClient } from "@/lib/supabase/server";
 import { Card } from "@/components/ui/Card";
 import { formatKCoins } from "@/lib/utils/currency";
-import type { Profile, Wallet } from "@/types/database";
+import {
+  getCurrentUser,
+  getProfile,
+  getWallet,
+} from "@/lib/firebase/firestore";
+import { SignOutButton } from "@/components/auth/SignOutButton";
 
 export const metadata = {
   title: "Dashboard — KoinWork",
 };
 
 export default async function DashboardPage() {
-  const supabase = await createClient();
+  const authUser = await getCurrentUser();
+  if (!authUser) redirect("/login");
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
-  if (!user) redirect("/login");
-
-  // Fetch profile
-  const { data: profileData } = await supabase
-    .from("profiles")
-    .select("*")
-    .eq("id", user.id)
-    .single();
-  const profile = profileData as Profile | null;
+  const [profile, wallet] = await Promise.all([
+    getProfile(authUser.uid),
+    getWallet(authUser.uid),
+  ]);
 
   if (!profile) redirect("/onboarding/role");
 
-  // Fetch wallet
-  const { data: walletData } = await supabase
-    .from("wallets")
-    .select("*")
-    .eq("user_id", user.id)
-    .single();
-  const wallet = walletData as Wallet | null;
-
   const isOwner = profile.role === "owner";
-
-  async function signOut() {
-    "use server";
-    const supabase = await createClient();
-    await supabase.auth.signOut();
-    redirect("/login");
-  }
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -64,14 +45,7 @@ export default async function DashboardPage() {
             >
               {isOwner ? "Owner" : "Employee"}
             </span>
-            <form action={signOut}>
-              <button
-                type="submit"
-                className="text-sm text-gray-400 hover:text-red-500 transition"
-              >
-                Sign out
-              </button>
-            </form>
+            <SignOutButton />
           </div>
         </div>
       </nav>
@@ -174,11 +148,11 @@ export default async function DashboardPage() {
         {/* Phase indicator */}
         <div className="mt-8 rounded-2xl border border-indigo-100 bg-indigo-50 p-6">
           <p className="text-sm font-semibold text-indigo-700">
-            🚧 Phase 1 Complete: Foundation
+            🚧 Phase 1 Complete: Foundation (Firebase)
           </p>
           <p className="mt-1 text-xs text-indigo-500">
-            Auth ✅ &nbsp;|&nbsp; Profiles ✅ &nbsp;|&nbsp; Wallet ✅ &nbsp;|&nbsp;
-            RLS Policies ✅ &nbsp;|&nbsp; DB Migrations ✅
+            Auth ✅ &nbsp;|&nbsp; Profiles (Firestore) ✅ &nbsp;|&nbsp; Wallet ✅
+            &nbsp;|&nbsp; Security Rules ✅ &nbsp;|&nbsp; Session Cookies ✅
           </p>
           <p className="mt-1 text-xs text-indigo-400">
             Next: Phase 2 — Campaign System (create, feed, per-slot escrow)

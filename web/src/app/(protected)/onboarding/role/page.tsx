@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { createClient } from "@/lib/supabase/client";
+import { auth } from "@/lib/firebase/client";
 import type { UserRole } from "@/types/database";
 
 const ROLES: { value: UserRole; label: string; emoji: string; desc: string }[] = [
@@ -22,7 +22,6 @@ const ROLES: { value: UserRole; label: string; emoji: string; desc: string }[] =
 
 export default function RoleSelectionPage() {
   const router = useRouter();
-  const supabase = createClient();
 
   const [selected, setSelected] = useState<UserRole | null>(null);
   const [loading, setLoading] = useState(false);
@@ -33,9 +32,7 @@ export default function RoleSelectionPage() {
     setLoading(true);
     setError(null);
 
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
+    const user = auth.currentUser;
 
     if (!user) {
       router.push("/login");

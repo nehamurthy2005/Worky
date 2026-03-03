@@ -1,48 +1,30 @@
 import { redirect } from "next/navigation";
 import Link from "next/link";
-import { createClient } from "@/lib/supabase/server";
 import { WalletCard, TransactionList } from "@/components/wallet/WalletCard";
-import type { Profile, Wallet, Transaction } from "@/types/database";
+import {
+  getCurrentUser,
+  getProfile,
+  getWallet,
+  getTransactions,
+} from "@/lib/firebase/firestore";
 
 export const metadata = {
   title: "Wallet — KoinWork",
 };
 
 export default async function WalletPage() {
-  const supabase = await createClient();
+  const authUser = await getCurrentUser();
+  if (!authUser) redirect("/login");
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
-  if (!user) redirect("/login");
-
-  const { data: profileData } = await supabase
-    .from("profiles")
-    .select("id, full_name, role, kyc_status")
-    .eq("id", user.id)
-    .single();
-  const profile = profileData as Pick<Profile, "id" | "full_name" | "role" | "kyc_status"> | null;
+  const [profile, wallet] = await Promise.all([
+    getProfile(authUser.uid),
+    getWallet(authUser.uid),
+  ]);
 
   if (!profile) redirect("/onboarding/role");
-
-  const { data: walletData } = await supabase
-    .from("wallets")
-    .select("*")
-    .eq("user_id", user.id)
-    .single();
-  const wallet = walletData as Wallet | null;
-
   if (!wallet) redirect("/dashboard");
 
-  // Fetch last 20 transactions
-  const { data: txData } = await supabase
-    .from("transactions")
-    .select("*")
-    .eq("wallet_id", wallet.id)
-    .order("created_at", { ascending: false })
-    .limit(20);
-  const transactions = (txData ?? []) as Transaction[];
+  const transactions = await getTransactions(wallet.id);
 
   return (
     <div className="min-h-screen bg-gray-50">

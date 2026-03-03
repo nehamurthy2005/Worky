@@ -2,25 +2,21 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { createClient } from "@/lib/supabase/client";
+import { auth } from "@/lib/firebase/client";
+import { onAuthStateChanged } from "firebase/auth";
 import { ProfileSetupForm } from "@/components/profile/ProfileSetupForm";
 import type { UserRole } from "@/types/database";
 
 export default function ProfileSetupPage() {
   const router = useRouter();
-  const supabase = createClient();
 
-  const [userId, setUserId] = useState<string | null>(null);
-  const [role, setRole] = useState<UserRole | null>(null);
+  const [userId, setUserId]       = useState<string | null>(null);
+  const [role, setRole]           = useState<UserRole | null>(null);
   const [prefillName, setPrefillName] = useState("");
 
   useEffect(() => {
-    async function load() {
-      const {
-        data: { user },
-      } = await supabase.auth.getUser();
-
-      if (!user) {
+    const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
+      if (!firebaseUser) {
         router.push("/login");
         return;
       }
@@ -31,13 +27,13 @@ export default function ProfileSetupPage() {
         return;
       }
 
-      setUserId(user.id);
+      setUserId(firebaseUser.uid);
       setRole(pendingRole);
-      setPrefillName(user.user_metadata?.full_name ?? "");
-    }
+      setPrefillName(firebaseUser.displayName ?? "");
+    });
 
-    load();
-  }, [supabase, router]);
+    return () => unsubscribe();
+  }, [router]);
 
   if (!userId || !role) {
     return (

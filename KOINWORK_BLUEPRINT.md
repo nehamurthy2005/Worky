@@ -37,16 +37,25 @@ A blue-collar gig economy platform connecting **Owners** (businesses/individuals
 
 ### Tech Stack
 
-| Layer | Technology |
-|-------|-----------|
-| Web frontend | Next.js 14 (App Router) |
-| Mobile frontend | React Native with Expo |
-| Backend / DB | Supabase (PostgreSQL + PostGIS + Realtime + Storage) |
-| Auth | Supabase Auth (email, phone, Google OAuth) |
-| Payments | Razorpay (India) / Stripe (international) |
-| Edge Functions | Supabase Edge Functions (Deno) |
-| Caching | Upstash Redis (session + feed cache) |
-| Monitoring | Sentry (errors), Supabase Dashboard (perf) |
+| Layer | Technology | Notes |
+|-------|-----------|-------|
+| Web frontend | Next.js 14+ (App Router) | Responsive, SSR + RSC |
+| Mobile frontend | React Native (Expo) | iOS + Android, cross-platform |
+| Auth | Firebase Authentication | Email, Google OAuth, Phone OTP |
+| Database | Firebase Firestore | NoSQL documents; integer paisa for money |
+| Realtime | Firebase Realtime Database | Low-latency notifications, job feed |
+| Storage | Firebase Storage | Avatars, KYC docs, work photos |
+| Server-side logic | Firebase Cloud Functions (Node 20) | All financial ops server-only |
+| Password hashing | Argon2 (via server functions) | For any additional credentials layer |
+| Secrets management | HashiCorp Vault | API keys, private keys, payment secrets |
+| Payments (primary) | Razorpay (India) | INR deposits, KCoin purchases |
+| Payments (secondary) | Cashfree (India) | Payouts / bank withdrawals |
+| Security / CDN | Cloudflare | DDoS, WAF, edge caching |
+| Monitoring | AWS CloudWatch | Logs, metrics, alerts |
+| Caching | Upstash Redis | Feed cache, session store |
+
+> **⚠️ Migration note (2026-03):** Project migrated from Supabase → Firebase.
+> All `supabase/migrations/` SQL files are archived; the canonical data layer is now Firestore (`firebase/rules/` + `firebase/indexes/`).
 
 ### User Roles
 
@@ -416,553 +425,263 @@ if (count > 10) throw new Error('Rate limit exceeded: max 10 applications per ho
 
 ---
 
-## 3. Optimized Database Schema
+## 3. Optimized Database Schema (Firestore)
 
-```sql
--- ============================================================
--- EXTENSIONS
--- ============================================================
-CREATE EXTENSION IF NOT EXISTS postgis;
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
+> **Migrated from PostgreSQL/PostGIS to Firebase Firestore.**
+> All monetary values are stored as integer **paisa** (never float).
+> 1 KCoin = 1000 paisa | ₹1 = 100 paisa | 1 KCoin = ₹10
+>
+> Security rules live in `firebase/rules/firestore.rules`.
+> Composite indexes live in `firebase/indexes/firestore.indexes.json`.
 
--- ============================================================
--- ENUMS
--- ============================================================
-CREATE TYPE user_role AS ENUM ('owner', 'employee');
-CREATE TYPE kyc_status AS ENUM ('NOT_SUBMITTED', 'PENDING', 'APPROVED', 'REJECTED');
+### Collection: `profiles`
 
-CREATE TYPE transaction_type AS ENUM (
-  'DEPOSIT',
-  'ESCROW_FREEZE',
-  'ESCROW_RELEASE',
-  'PAYMENT',
-  'WITHDRAWAL',
-  'REFUND',
-  'BOOST_FEE'
-);
+```typescript
+// Document ID = Firebase Auth UID
+interface ProfileDoc {
+  role:                'owner' | 'employee';
+  full_name:           string;
+  phone:               string | null;
+  avatar_url:          string | null;
+  bio:                 string | null;
+  lat:                 number | null;   // decimal degrees
+  lng:                 number | null;
+  city:                string | null;
+  state:               string | null;
+  location_updated_at: Timestamp;
+  kyc_status:          'NOT_SUBMITTED' | 'PENDING' | 'APPROVED' | 'REJECTED';
+  kyc_verified_at:     Timestamp | null;
+  avg_rating:          number;          // 0–5, denormalised
+  total_reviews:       number;
+  is_active:           boolean;
+  created_at:          Timestamp;
+  updated_at:          Timestamp;
+}
+```
 
-CREATE TYPE transaction_status AS ENUM (
-  'PENDING',
-  'COMPLETED',
-  'FAILED',
-  'REVERSED'
-);
+### Collection: `wallets`
 
-CREATE TYPE campaign_status AS ENUM (
-  'DRAFT',
-  'OPEN',
-  'IN_PROGRESS',
-  'SETTLING',
-  'SETTLED',
-  'CANCELLED'
-);
+```typescript
+// Document ID = "wallet_{uid}"
+// ⚠️  CLIENT WRITES FORBIDDEN — use Cloud Functions only
+interface WalletDoc {
+  user_id:           string;   // Firebase Auth UID
+  available_balance: number;   // integer paisa — NEVER float
+  frozen_balance:    number;   // paisa frozen for escrow / pending withdrawal
+  lifetime_earned:   number;   // paisa total ever credited
+  lifetime_spent:    number;   // paisa total ever debited
+  created_at:        Timestamp;
+  updated_at:        Timestamp;
+}
+```
 
-CREATE TYPE escrow_status AS ENUM (
-  'NONE',
-  'FROZEN',
-  'PARTIAL_RELEASE',
-  'SETTLED',
-  'REFUNDED'
-);
+### Collection: `transactions`
 
-CREATE TYPE slot_status AS ENUM (
-  'AVAILABLE',
-  'APPLIED',
-  'ASSIGNED',
-  'COMPLETED',
-  'NO_SHOW',
-  'DISPUTED',
-  'CANCELLED'
-);
+```typescript
+// Document ID = auto-generated
+// ⚠️  CLIENT WRITES FORBIDDEN — use Cloud Functions only
+interface TransactionDoc {
+  wallet_id:        string;
+  amount_paisa:     number;   // positive = credit, negative = debit (integer)
+  type:             'DEPOSIT' | 'ESCROW_FREEZE' | 'ESCROW_RELEASE' | 'PAYMENT'
+                  | 'WITHDRAWAL' | 'REFUND' | 'BOOST_FEE';
+  status:           'PENDING' | 'COMPLETED' | 'FAILED' | 'REVERSED';
+  idempotency_key:  string;   // UNIQUE — prevents duplicate webhook credits
+  reference_id:     string | null;
+  reference_type:   string | null;  // e.g. "campaign", "work_log"
+  description:      string | null;
+  metadata:         Record<string, unknown>;
+  created_at:       Timestamp;
+  updated_at:       Timestamp;
+}
+```
 
-CREATE TYPE application_status AS ENUM (
-  'PENDING',
-  'ACCEPTED',
-  'REJECTED',
-  'WITHDRAWN'
-);
+> **Idempotency:** Before inserting any transaction, the Cloud Function queries
+> `WHERE idempotency_key == key LIMIT 1`. If a doc already exists, the operation
+> is a no-op and the existing result is returned. This prevents Razorpay/Cashfree
+> webhook retries from double-crediting wallets.
 
-CREATE TYPE withdrawal_status AS ENUM (
-  'PENDING',
-  'PROCESSING',
-  'COMPLETED',
-  'FAILED',
-  'CANCELLED'
-);
+### Collection: `campaigns`
 
-CREATE TYPE dispute_status AS ENUM (
-  'OPEN',
-  'UNDER_REVIEW',
-  'RESOLVED_OWNER',
-  'RESOLVED_EMPLOYEE',
-  'CLOSED'
-);
+```typescript
+interface CampaignDoc {
+  owner_id:            string;
+  title:               string;
+  description:         string;
+  instructions:        string;
+  category:            string;
+  lat:                 number;
+  lng:                 number;
+  city:                string;
+  state:               string;
+  geohash:             string;  // for proximity queries without PostGIS
+  max_workers:         number;
+  pay_per_day_rupees:  number;
+  duration_days:       number;
+  start_date:          Timestamp;
+  status:              'DRAFT' | 'OPEN' | 'IN_PROGRESS' | 'SETTLING' | 'SETTLED' | 'CANCELLED';
+  escrow_status:       'NONE' | 'FROZEN' | 'PARTIAL_RELEASE' | 'SETTLED' | 'REFUNDED';
+  escrow_amount_paisa: number;   // total frozen at creation
+  total_slots_filled:  number;
+  boost_tier:          'NONE' | 'BASIC' | 'STANDARD' | 'PREMIUM';
+  boost_expires_at:    Timestamp | null;
+  created_at:          Timestamp;
+  updated_at:          Timestamp;
+}
+```
 
-CREATE TYPE boost_tier AS ENUM ('BASIC', 'STANDARD', 'PREMIUM');
+> **Proximity queries:** Use the `geofire-common` library to encode lat/lng as a
+> geohash string. Query `WHERE geohash >= lower AND geohash <= upper` to find
+> campaigns within a radius. This replaces PostGIS `ST_DWithin`.
 
-CREATE TYPE notification_type AS ENUM (
-  'APPLICATION_RECEIVED',
-  'APPLICATION_ACCEPTED',
-  'APPLICATION_REJECTED',
-  'WORK_APPROVED',
-  'PAYMENT_RECEIVED',
-  'WITHDRAWAL_PROCESSED',
-  'DISPUTE_UPDATE',
-  'CAMPAIGN_UPDATE',
-  'SYSTEM'
-);
+### Collection: `campaign_slots`
 
--- ============================================================
--- PROFILES
--- ============================================================
-CREATE TABLE profiles (
-  id                   UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
-  role                 user_role NOT NULL,
-  full_name            TEXT NOT NULL,
-  phone                TEXT UNIQUE,
-  avatar_url           TEXT,
-  bio                  TEXT,
-  -- PostGIS geography for distance calculations
-  location             geography(Point, 4326),
-  city                 TEXT,
-  state                TEXT,
-  location_updated_at  TIMESTAMPTZ DEFAULT NOW(),
-  kyc_status           kyc_status NOT NULL DEFAULT 'NOT_SUBMITTED',
-  kyc_verified_at      TIMESTAMPTZ,
-  -- aggregate rating (stored denormalized for feed performance)
-  avg_rating           NUMERIC(3,2) DEFAULT 0,
-  total_reviews        INT DEFAULT 0,
-  is_active            BOOLEAN DEFAULT TRUE,
-  created_at           TIMESTAMPTZ DEFAULT NOW(),
-  updated_at           TIMESTAMPTZ DEFAULT NOW()
-);
+```typescript
+// One document per worker slot — enables per-slot escrow tracking
+interface CampaignSlotDoc {
+  campaign_id:    string;
+  employee_id:    string | null;
+  escrow_paisa:   number;        // frozen per slot (pay_per_day × duration)
+  status:         'AVAILABLE' | 'APPLIED' | 'ASSIGNED' | 'COMPLETED'
+                | 'NO_SHOW' | 'DISPUTED' | 'CANCELLED';
+  assigned_at:    Timestamp | null;
+  completed_at:   Timestamp | null;
+  created_at:     Timestamp;
+  updated_at:     Timestamp;
+}
+```
 
-CREATE INDEX idx_profiles_location ON profiles USING GIST (location);
-CREATE INDEX idx_profiles_role ON profiles (role);
-CREATE INDEX idx_profiles_city ON profiles (city);
+### Collection: `applications`
 
-ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;
+```typescript
+interface ApplicationDoc {
+  campaign_id:  string;
+  employee_id:  string;
+  slot_id:      string | null;
+  status:       'PENDING' | 'ACCEPTED' | 'REJECTED' | 'WITHDRAWN';
+  cover_note:   string | null;
+  created_at:   Timestamp;
+  updated_at:   Timestamp;
+}
+```
 
--- ============================================================
--- WALLETS
--- ============================================================
--- All monetary values stored in PAISA (integer)
--- 1 KCoin = 1000 paisa | ₹1 = 100 paisa | 1 KCoin = ₹10 = 1000 paisa
-CREATE TABLE wallets (
-  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id           UUID NOT NULL UNIQUE REFERENCES profiles(id) ON DELETE CASCADE,
-  -- paisa amounts (integer — no floating point)
-  available_balance BIGINT NOT NULL DEFAULT 0 CHECK (available_balance >= 0),
-  frozen_balance    BIGINT NOT NULL DEFAULT 0 CHECK (frozen_balance >= 0),
-  lifetime_earned   BIGINT NOT NULL DEFAULT 0,
-  lifetime_spent    BIGINT NOT NULL DEFAULT 0,
-  created_at        TIMESTAMPTZ DEFAULT NOW(),
-  updated_at        TIMESTAMPTZ DEFAULT NOW()
-);
+> **Rate limit index:** `(employee_id ASC, created_at DESC)` — Cloud Function
+> queries last hour's count before allowing a new application. Limit: 10/hour.
 
-CREATE INDEX idx_wallets_user_id ON wallets (user_id);
+### Collection: `work_logs`
 
-ALTER TABLE wallets ENABLE ROW LEVEL SECURITY;
+```typescript
+interface WorkLogDoc {
+  campaign_id:               string;
+  employee_id:               string;
+  work_date:                 string;       // "YYYY-MM-DD"
+  checkin_at:                Timestamp | null;
+  checkin_lat:               number | null;
+  checkin_lng:               number | null;
+  checkin_distance_meters:   number | null; // distance from job site at check-in
+  checkout_at:               Timestamp | null;
+  shift_duration_minutes:    number | null;
+  status:                    'PENDING' | 'APPROVED' | 'DISPUTED' | 'AUTO_APPROVED';
+  approved_at:               Timestamp | null;
+  created_at:                Timestamp;
+  updated_at:                Timestamp;
+}
+```
 
--- ============================================================
--- TRANSACTIONS
--- ============================================================
-CREATE TABLE transactions (
-  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  wallet_id        UUID NOT NULL REFERENCES wallets(id),
-  amount_paisa     BIGINT NOT NULL,
-  type             transaction_type NOT NULL,
-  status           transaction_status NOT NULL DEFAULT 'PENDING',
-  -- idempotency_key prevents duplicate credits on webhook retry
-  idempotency_key  TEXT NOT NULL UNIQUE,
-  reference_id     UUID,              -- campaign_id, withdrawal_id, etc.
-  reference_type   TEXT,              -- 'campaign', 'withdrawal', 'boost_purchase'
-  description      TEXT,
-  metadata         JSONB DEFAULT '{}',
-  created_at       TIMESTAMPTZ DEFAULT NOW(),
-  updated_at       TIMESTAMPTZ DEFAULT NOW()
-);
+> **Geofence check-in:** Must be within 200m of job site.
+> **Shift validation:** Minimum 4h, maximum 16h.
 
-CREATE UNIQUE INDEX idx_transactions_idempotency ON transactions (idempotency_key);
-CREATE INDEX idx_transactions_wallet_id ON transactions (wallet_id);
-CREATE INDEX idx_transactions_reference ON transactions (reference_id, reference_type);
-CREATE INDEX idx_transactions_created_at ON transactions (created_at DESC);
+### Collection: `withdrawals`
 
-ALTER TABLE transactions ENABLE ROW LEVEL SECURITY;
+```typescript
+interface WithdrawalDoc {
+  user_id:         string;
+  amount_paisa:    number;
+  status:          'PENDING' | 'PROCESSING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
+  bank_details:    { upi?: string; account_no?: string; ifsc?: string };
+  idempotency_key: string;
+  tds_paisa:       number;   // TDS deducted (10% on amounts crossing ₹30K/year)
+  razorpay_payout_id: string | null;
+  created_at:      Timestamp;
+  updated_at:      Timestamp;
+}
+```
 
--- ============================================================
--- CAMPAIGNS
--- ============================================================
-CREATE TABLE campaigns (
-  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  owner_id          UUID NOT NULL REFERENCES profiles(id),
-  title             TEXT NOT NULL,
-  description       TEXT NOT NULL,
-  category          TEXT NOT NULL,
-  -- pay per slot in paisa
-  pay_per_slot_paisa BIGINT NOT NULL CHECK (pay_per_slot_paisa > 0),
-  total_slots       INT NOT NULL CHECK (total_slots > 0),
-  filled_slots      INT NOT NULL DEFAULT 0,
-  -- PostGIS location
-  location          geography(Point, 4326) NOT NULL,
-  address           TEXT NOT NULL,
-  city              TEXT NOT NULL,
-  state             TEXT NOT NULL,
-  -- scheduling
-  start_date        DATE NOT NULL,
-  end_date          DATE NOT NULL,
-  shift_start_time  TIME NOT NULL,
-  shift_end_time    TIME NOT NULL,
-  -- state machine
-  status            campaign_status NOT NULL DEFAULT 'DRAFT',
-  escrow_status     escrow_status NOT NULL DEFAULT 'NONE',
-  -- boost
-  boost_tier        boost_tier,
-  boost_expires_at  TIMESTAMPTZ,
-  -- feed score (denormalized for performance)
-  feed_score        NUMERIC(10,4) DEFAULT 0,
-  -- template
-  is_template       BOOLEAN DEFAULT FALSE,
-  template_name     TEXT,
-  created_at        TIMESTAMPTZ DEFAULT NOW(),
-  updated_at        TIMESTAMPTZ DEFAULT NOW(),
-  CHECK (end_date >= start_date)
-);
+### Collection: `disputes`
 
-CREATE INDEX idx_campaigns_location ON campaigns USING GIST (location);
-CREATE INDEX idx_campaigns_status ON campaigns (status);
-CREATE INDEX idx_campaigns_owner_id ON campaigns (owner_id);
-CREATE INDEX idx_campaigns_city ON campaigns (city);
-CREATE INDEX idx_campaigns_category ON campaigns (category);
-CREATE INDEX idx_campaigns_feed_score ON campaigns (feed_score DESC) WHERE status = 'OPEN';
-CREATE INDEX idx_campaigns_boost ON campaigns (boost_expires_at) WHERE boost_tier IS NOT NULL;
+```typescript
+interface DisputeDoc {
+  campaign_id:  string;
+  work_log_id:  string | null;
+  raised_by:    string;   // uid
+  against:      string;   // uid
+  description:  string;
+  evidence_urls: string[];
+  status:       'OPEN' | 'UNDER_REVIEW' | 'RESOLVED_OWNER' | 'RESOLVED_EMPLOYEE' | 'CLOSED';
+  resolution_note: string | null;
+  resolved_at:  Timestamp | null;
+  created_at:   Timestamp;
+  updated_at:   Timestamp;
+}
+```
 
-ALTER TABLE campaigns ENABLE ROW LEVEL SECURITY;
+```mermaid
+stateDiagram-v2
+    [*] --> OPEN: dispute raised
+    OPEN --> UNDER_REVIEW: admin picks up
+    UNDER_REVIEW --> RESOLVED_OWNER: owner vindicated
+    UNDER_REVIEW --> RESOLVED_EMPLOYEE: employee vindicated
+    RESOLVED_OWNER --> CLOSED
+    RESOLVED_EMPLOYEE --> CLOSED
+    CLOSED --> [*]
+```
 
--- ============================================================
--- CAMPAIGN SLOTS (per-worker escrow tracking)
--- ============================================================
-CREATE TABLE campaign_slots (
-  id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  campaign_id         UUID NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
-  employee_id         UUID REFERENCES profiles(id),
-  status              slot_status NOT NULL DEFAULT 'AVAILABLE',
-  -- per-slot escrow amount (frozen from owner's wallet)
-  escrow_amount_paisa BIGINT NOT NULL DEFAULT 0,
-  escrow_transaction_id UUID REFERENCES transactions(id),
-  -- timestamps
-  assigned_at         TIMESTAMPTZ,
-  completed_at        TIMESTAMPTZ,
-  released_at         TIMESTAMPTZ,
-  created_at          TIMESTAMPTZ DEFAULT NOW(),
-  updated_at          TIMESTAMPTZ DEFAULT NOW()
-);
+### Collection: `notifications`
 
-CREATE INDEX idx_campaign_slots_campaign_id ON campaign_slots (campaign_id);
-CREATE INDEX idx_campaign_slots_employee_id ON campaign_slots (employee_id);
-CREATE INDEX idx_campaign_slots_status ON campaign_slots (status);
--- for no-show detection cron job
-CREATE INDEX idx_campaign_slots_no_show ON campaign_slots (assigned_at)
-  WHERE status = 'ASSIGNED';
+```typescript
+interface NotificationDoc {
+  user_id:   string;
+  type:      'APPLICATION_RECEIVED' | 'APPLICATION_ACCEPTED' | 'APPLICATION_REJECTED'
+           | 'WORK_APPROVED' | 'PAYMENT_RECEIVED' | 'WITHDRAWAL_PROCESSED'
+           | 'DISPUTE_UPDATE' | 'CAMPAIGN_UPDATE' | 'SYSTEM';
+  title:     string;
+  body:      string;
+  read:      boolean;
+  data:      Record<string, string>;  // deep link payload
+  created_at: Timestamp;
+}
+```
 
-ALTER TABLE campaign_slots ENABLE ROW LEVEL SECURITY;
+### Collection: `fraud_flags`
 
--- ============================================================
--- APPLICATIONS
--- ============================================================
-CREATE TABLE applications (
-  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  campaign_id UUID NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
-  employee_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
-  slot_id     UUID REFERENCES campaign_slots(id),
-  status      application_status NOT NULL DEFAULT 'PENDING',
-  cover_note  TEXT,
-  created_at  TIMESTAMPTZ DEFAULT NOW(),
-  updated_at  TIMESTAMPTZ DEFAULT NOW(),
-  UNIQUE (campaign_id, employee_id)  -- one application per campaign per employee
-);
+```typescript
+interface FraudFlagDoc {
+  user_id:      string;
+  score:        number;   // ≥50 = auto-hold
+  signals:      { reason: string; score: number }[];
+  status:       'PENDING_REVIEW' | 'CLEARED' | 'CONFIRMED_FRAUD';
+  created_at:   Timestamp;
+  updated_at:   Timestamp;
+}
+```
 
-CREATE INDEX idx_applications_campaign_id ON applications (campaign_id);
-CREATE INDEX idx_applications_employee_id ON applications (employee_id);
-CREATE INDEX idx_applications_status ON applications (status);
--- rate limit check: count recent applications by employee
-CREATE INDEX idx_applications_rate_limit ON applications (employee_id, created_at DESC);
+### Escrow State Machine
 
-ALTER TABLE applications ENABLE ROW LEVEL SECURITY;
-
--- ============================================================
--- WORK LOGS
--- ============================================================
-CREATE TABLE work_logs (
-  id                         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  slot_id                    UUID NOT NULL REFERENCES campaign_slots(id) ON DELETE CASCADE,
-  campaign_id                UUID NOT NULL REFERENCES campaigns(id),
-  employee_id                UUID NOT NULL REFERENCES profiles(id),
-  -- check-in
-  checkin_time               TIMESTAMPTZ NOT NULL,
-  checkin_lat                DOUBLE PRECISION NOT NULL,
-  checkin_lng                DOUBLE PRECISION NOT NULL,
-  checkin_distance_meters    DOUBLE PRECISION NOT NULL, -- distance from job site at check-in
-  checkin_photo_url          TEXT,
-  -- check-out
-  checkout_time              TIMESTAMPTZ,
-  checkout_lat               DOUBLE PRECISION,
-  checkout_lng               DOUBLE PRECISION,
-  checkout_distance_meters   DOUBLE PRECISION,
-  checkout_photo_url         TEXT,
-  -- calculated fields
-  shift_duration_minutes     INT,  -- computed on checkout
-  -- approval
-  is_approved                BOOLEAN,
-  approved_by                UUID REFERENCES profiles(id),
-  approved_at                TIMESTAMPTZ,
-  -- anomaly flags (for batch approval UI)
-  flag_distance_anomaly      BOOLEAN DEFAULT FALSE,
-  flag_duration_anomaly      BOOLEAN DEFAULT FALSE,
-  flag_time_anomaly          BOOLEAN DEFAULT FALSE,
-  flag_location_jump         BOOLEAN DEFAULT FALSE,
-  -- constraints
-  created_at                 TIMESTAMPTZ DEFAULT NOW(),
-  updated_at                 TIMESTAMPTZ DEFAULT NOW(),
-  -- server-enforced validations
-  CONSTRAINT valid_checkout_after_checkin
-    CHECK (checkout_time IS NULL OR checkout_time > checkin_time),
-  CONSTRAINT valid_min_shift
-    CHECK (
-      checkout_time IS NULL OR
-      EXTRACT(EPOCH FROM (checkout_time - checkin_time)) / 3600 >= 4
-    ),
-  CONSTRAINT valid_max_shift
-    CHECK (
-      checkout_time IS NULL OR
-      EXTRACT(EPOCH FROM (checkout_time - checkin_time)) / 3600 <= 16
-    ),
-  CONSTRAINT valid_checkin_distance
-    CHECK (checkin_distance_meters <= 200)  -- must be within 200m
-);
-
-CREATE INDEX idx_work_logs_slot_id ON work_logs (slot_id);
-CREATE INDEX idx_work_logs_employee_id ON work_logs (employee_id);
-CREATE INDEX idx_work_logs_campaign_id ON work_logs (campaign_id);
-CREATE INDEX idx_work_logs_pending_approval ON work_logs (campaign_id, is_approved)
-  WHERE is_approved IS NULL;
-CREATE INDEX idx_work_logs_flagged ON work_logs (campaign_id)
-  WHERE flag_distance_anomaly OR flag_duration_anomaly
-     OR flag_time_anomaly OR flag_location_jump;
-
-ALTER TABLE work_logs ENABLE ROW LEVEL SECURITY;
-
--- ============================================================
--- WITHDRAWALS
--- ============================================================
-CREATE TABLE withdrawals (
-  id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  wallet_id            UUID NOT NULL REFERENCES wallets(id),
-  user_id              UUID NOT NULL REFERENCES profiles(id),
-  amount_paisa         BIGINT NOT NULL CHECK (amount_paisa > 0),
-  status               withdrawal_status NOT NULL DEFAULT 'PENDING',
-  -- bank details (should be encrypted at rest in production)
-  bank_account_number  TEXT NOT NULL,
-  bank_ifsc            TEXT NOT NULL,
-  bank_account_name    TEXT NOT NULL,
-  -- KYC reference
-  kyc_status_at_request kyc_status NOT NULL,
-  -- payment gateway
-  razorpay_payout_id   TEXT,
-  failure_reason       TEXT,
-  -- TDS
-  tds_deducted_paisa   BIGINT DEFAULT 0,
-  -- freeze transaction reference
-  freeze_transaction_id UUID REFERENCES transactions(id),
-  processed_at         TIMESTAMPTZ,
-  created_at           TIMESTAMPTZ DEFAULT NOW(),
-  updated_at           TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX idx_withdrawals_user_id ON withdrawals (user_id);
-CREATE INDEX idx_withdrawals_wallet_id ON withdrawals (wallet_id);
-CREATE INDEX idx_withdrawals_status ON withdrawals (status);
-
-ALTER TABLE withdrawals ENABLE ROW LEVEL SECURITY;
-
--- ============================================================
--- DISPUTES
--- ============================================================
-CREATE TABLE disputes (
-  id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  work_log_id    UUID NOT NULL REFERENCES work_logs(id),
-  campaign_id    UUID NOT NULL REFERENCES campaigns(id),
-  raised_by      UUID NOT NULL REFERENCES profiles(id),
-  against        UUID NOT NULL REFERENCES profiles(id),
-  status         dispute_status NOT NULL DEFAULT 'OPEN',
-  reason         TEXT NOT NULL,
-  evidence_urls  TEXT[] DEFAULT '{}',
-  -- admin resolution
-  resolved_by    UUID REFERENCES profiles(id),
-  resolution_note TEXT,
-  resolved_at    TIMESTAMPTZ,
-  created_at     TIMESTAMPTZ DEFAULT NOW(),
-  updated_at     TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX idx_disputes_campaign_id ON disputes (campaign_id);
-CREATE INDEX idx_disputes_raised_by ON disputes (raised_by);
-CREATE INDEX idx_disputes_status ON disputes (status);
-
-ALTER TABLE disputes ENABLE ROW LEVEL SECURITY;
-
--- ============================================================
--- BOOST PURCHASES
--- ============================================================
-CREATE TABLE boost_purchases (
-  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  campaign_id       UUID NOT NULL REFERENCES campaigns(id),
-  owner_id          UUID NOT NULL REFERENCES profiles(id),
-  tier              boost_tier NOT NULL,
-  cost_paisa        BIGINT NOT NULL,
-  duration_hours    INT NOT NULL,
-  starts_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  expires_at        TIMESTAMPTZ NOT NULL,
-  transaction_id    UUID REFERENCES transactions(id),
-  created_at        TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX idx_boost_purchases_campaign_id ON boost_purchases (campaign_id);
-CREATE INDEX idx_boost_purchases_expires_at ON boost_purchases (expires_at)
-  WHERE expires_at > NOW();
-
-ALTER TABLE boost_purchases ENABLE ROW LEVEL SECURITY;
-
--- ============================================================
--- NOTIFICATIONS
--- ============================================================
-CREATE TABLE notifications (
-  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id     UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
-  type        notification_type NOT NULL,
-  title       TEXT NOT NULL,
-  body        TEXT NOT NULL,
-  data        JSONB DEFAULT '{}',
-  is_read     BOOLEAN DEFAULT FALSE,
-  created_at  TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX idx_notifications_user_id ON notifications (user_id, is_read, created_at DESC);
-
-ALTER TABLE notifications ENABLE ROW LEVEL SECURITY;
-
--- ============================================================
--- FRAUD FLAGS
--- ============================================================
-CREATE TABLE fraud_flags (
-  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id      UUID NOT NULL REFERENCES profiles(id),
-  score        INT NOT NULL DEFAULT 0,
-  signals      JSONB DEFAULT '{}',  -- { account_age_days: 3, fast_withdrawal: true, ... }
-  is_resolved  BOOLEAN DEFAULT FALSE,
-  reviewed_by  UUID REFERENCES profiles(id),
-  notes        TEXT,
-  created_at   TIMESTAMPTZ DEFAULT NOW(),
-  updated_at   TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX idx_fraud_flags_user_id ON fraud_flags (user_id);
-CREATE INDEX idx_fraud_flags_unresolved ON fraud_flags (score DESC)
-  WHERE is_resolved = FALSE;
-
-ALTER TABLE fraud_flags ENABLE ROW LEVEL SECURITY;
-
--- ============================================================
--- REVIEWS
--- ============================================================
-CREATE TABLE reviews (
-  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  campaign_id   UUID NOT NULL REFERENCES campaigns(id),
-  reviewer_id   UUID NOT NULL REFERENCES profiles(id),
-  reviewee_id   UUID NOT NULL REFERENCES profiles(id),
-  rating        INT NOT NULL CHECK (rating BETWEEN 1 AND 5),
-  comment       TEXT,
-  -- for rating decay: weight decreases over time
-  created_at    TIMESTAMPTZ DEFAULT NOW(),
-  UNIQUE (campaign_id, reviewer_id, reviewee_id)
-);
-
-CREATE INDEX idx_reviews_reviewee_id ON reviews (reviewee_id, created_at DESC);
-
-ALTER TABLE reviews ENABLE ROW LEVEL SECURITY;
-
--- ============================================================
--- TRIGGERS
--- ============================================================
-
--- Auto-update updated_at
-CREATE OR REPLACE FUNCTION update_updated_at()
-RETURNS TRIGGER LANGUAGE plpgsql AS $$
-BEGIN
-  NEW.updated_at = NOW();
-  RETURN NEW;
-END;
-$$;
-
-DO $$
-DECLARE tbl TEXT;
-BEGIN
-  FOREACH tbl IN ARRAY ARRAY[
-    'profiles','wallets','transactions','campaigns','campaign_slots',
-    'applications','work_logs','withdrawals','disputes','fraud_flags'
-  ] LOOP
-    EXECUTE format(
-      'CREATE TRIGGER trg_%s_updated_at
-       BEFORE UPDATE ON %s
-       FOR EACH ROW EXECUTE FUNCTION update_updated_at()',
-      tbl, tbl
-    );
-  END LOOP;
-END;
-$$;
-
--- Trigger: freeze wallet on withdrawal request
-CREATE OR REPLACE FUNCTION freeze_withdrawal_amount()
-RETURNS TRIGGER LANGUAGE plpgsql SECURITY DEFINER AS $$
-BEGIN
-  UPDATE wallets
-  SET available_balance = available_balance - NEW.amount_paisa,
-      frozen_balance    = frozen_balance    + NEW.amount_paisa
-  WHERE id = NEW.wallet_id
-    AND available_balance >= NEW.amount_paisa;
-
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'Insufficient available balance for withdrawal';
-  END IF;
-  RETURN NEW;
-END;
-$$;
-
-CREATE TRIGGER trg_freeze_on_withdrawal
-AFTER INSERT ON withdrawals
-FOR EACH ROW
-WHEN (NEW.status = 'PENDING')
-EXECUTE FUNCTION freeze_withdrawal_amount();
-
--- Trigger: auto-compute shift_duration_minutes on work log checkout
-CREATE OR REPLACE FUNCTION compute_shift_duration()
-RETURNS TRIGGER LANGUAGE plpgsql AS $$
-BEGIN
-  IF NEW.checkout_time IS NOT NULL AND OLD.checkout_time IS NULL THEN
-    NEW.shift_duration_minutes :=
-      EXTRACT(EPOCH FROM (NEW.checkout_time - NEW.checkin_time)) / 60;
-  END IF;
-  RETURN NEW;
-END;
-$$;
-
-CREATE TRIGGER trg_compute_shift_duration
-BEFORE UPDATE ON work_logs
-FOR EACH ROW EXECUTE FUNCTION compute_shift_duration();
+```mermaid
+stateDiagram-v2
+    [*] --> NONE: wallet funded
+    NONE --> FROZEN: campaign created (50% escrow)
+    FROZEN --> PARTIAL_RELEASE: some slots completed
+    PARTIAL_RELEASE --> SETTLED: all slots done
+    FROZEN --> SETTLED: all slots done immediately
+    FROZEN --> REFUNDED: campaign cancelled (no workers)
+    PARTIAL_RELEASE --> REFUNDED: remaining unfilled slots refunded
+    SETTLED --> [*]
+    REFUNDED --> [*]
 ```
 
 ---
+
 
 ## 4. Edge Functions (Server-Side Logic)
 
@@ -1707,249 +1426,240 @@ ORDER BY application_count DESC;
 
 ## 7. Security Hardened Architecture
 
-### 7.1 Row Level Security (RLS) Policies
+### 7.1 Firebase Security Rules
 
-```sql
--- ============================================================
--- PROFILES RLS
--- ============================================================
-CREATE POLICY "Users can view any profile"
-  ON profiles FOR SELECT USING (true);
+Security rules are the Firebase equivalent of PostgreSQL RLS. They are enforced server-side by Firestore on every read/write.
 
-CREATE POLICY "Users can update their own profile"
-  ON profiles FOR UPDATE USING (auth.uid() = id);
+Full rules: `firebase/rules/firestore.rules`
 
-CREATE POLICY "Users can insert their own profile"
-  ON profiles FOR INSERT WITH CHECK (auth.uid() = id);
+Key rules summary:
 
--- ============================================================
--- WALLETS RLS
--- ============================================================
-CREATE POLICY "Users can view their own wallet"
-  ON wallets FOR SELECT USING (auth.uid() = user_id);
+| Collection | Client Read | Client Write | Notes |
+|------------|-------------|--------------|-------|
+| `profiles` | Any signed-in user | Owner only | Can't change `role`, `kyc_status` |
+| `wallets` | Owner only | ❌ Cloud Function only | Prevents client-side balance manipulation |
+| `transactions` | Owner only | ❌ Cloud Function only | Idempotency enforced server-side |
+| `campaigns` | Public | Owner (via CF) | Escrow fields locked to CF |
+| `applications` | Owner + Campaign Owner | Employee create only | Status changes via CF |
+| `work_logs` | Employee + Campaign Owner | Employee check-in only | Approval via CF |
+| `withdrawals` | Owner only | Employee create only | Processing via CF |
+| `fraud_flags` | ❌ Admin only | ❌ CF only | |
 
--- No direct INSERT/UPDATE/DELETE by users — only Edge Functions (service role)
+---
 
--- ============================================================
--- TRANSACTIONS RLS
--- ============================================================
-CREATE POLICY "Users can view their own transactions"
-  ON transactions FOR SELECT
-  USING (wallet_id IN (SELECT id FROM wallets WHERE user_id = auth.uid()));
+### 7.2 HashiCorp Vault Integration
 
--- No direct INSERT/UPDATE/DELETE by users — only Edge Functions (service role)
+All production secrets (Firebase service account, Razorpay keys, Cashfree keys) are stored in HashiCorp Vault — **not** in `.env` files or CI/CD variables.
 
--- ============================================================
--- CAMPAIGNS RLS
--- ============================================================
-CREATE POLICY "Anyone can view open campaigns"
-  ON campaigns FOR SELECT USING (status IN ('OPEN', 'IN_PROGRESS'));
+```typescript
+// web/src/lib/vault/client.ts — server-side secret retrieval
+import VaultClient from "node-vault";
 
-CREATE POLICY "Owners can view all their campaigns"
-  ON campaigns FOR SELECT USING (owner_id = auth.uid());
+const vault = VaultClient({
+  endpoint: process.env.VAULT_ADDR!,
+  token:    process.env.VAULT_TOKEN!,
+});
 
-CREATE POLICY "Owners can update their own campaigns"
-  ON campaigns FOR UPDATE USING (owner_id = auth.uid());
+export async function getSecret(path: string): Promise<Record<string, string>> {
+  const result = await vault.read(`secret/data/koinwork/${path}`);
+  return result.data.data;
+}
 
--- INSERT via Edge Function only (service role) to enforce escrow validation
+// Usage in Cloud Functions:
+// const { razorpay_key_secret } = await getSecret("razorpay");
+```
 
--- ============================================================
--- CAMPAIGN SLOTS RLS
--- ============================================================
-CREATE POLICY "Campaign owner can view slots"
-  ON campaign_slots FOR SELECT
-  USING (campaign_id IN (SELECT id FROM campaigns WHERE owner_id = auth.uid()));
-
-CREATE POLICY "Assigned employee can view their slot"
-  ON campaign_slots FOR SELECT USING (employee_id = auth.uid());
-
--- ============================================================
--- APPLICATIONS RLS
--- ============================================================
-CREATE POLICY "Employees can view their own applications"
-  ON applications FOR SELECT USING (employee_id = auth.uid());
-
-CREATE POLICY "Campaign owners can view applications to their campaigns"
-  ON applications FOR SELECT
-  USING (campaign_id IN (SELECT id FROM campaigns WHERE owner_id = auth.uid()));
-
-CREATE POLICY "Employees can create applications"
-  ON applications FOR INSERT WITH CHECK (employee_id = auth.uid());
-
-CREATE POLICY "Employees can withdraw their application"
-  ON applications FOR UPDATE
-  USING (employee_id = auth.uid() AND status = 'PENDING')
-  WITH CHECK (status = 'WITHDRAWN');
-
--- ============================================================
--- WORK LOGS RLS
--- ============================================================
-CREATE POLICY "Employees can view their own work logs"
-  ON work_logs FOR SELECT USING (employee_id = auth.uid());
-
-CREATE POLICY "Campaign owners can view work logs for their campaigns"
-  ON work_logs FOR SELECT
-  USING (campaign_id IN (SELECT id FROM campaigns WHERE owner_id = auth.uid()));
-
-CREATE POLICY "Employees can create work logs (check-in)"
-  ON work_logs FOR INSERT WITH CHECK (employee_id = auth.uid());
-
--- ============================================================
--- WITHDRAWALS RLS
--- ============================================================
-CREATE POLICY "Users can view their own withdrawals"
-  ON withdrawals FOR SELECT USING (user_id = auth.uid());
-
--- INSERT via Edge Function only (triggers wallet freeze)
-
--- ============================================================
--- DISPUTES RLS
--- ============================================================
-CREATE POLICY "Dispute parties can view their disputes"
-  ON disputes FOR SELECT
-  USING (raised_by = auth.uid() OR against = auth.uid());
-
-CREATE POLICY "Users can create disputes"
-  ON disputes FOR INSERT WITH CHECK (raised_by = auth.uid());
-
--- ============================================================
--- NOTIFICATIONS RLS
--- ============================================================
-CREATE POLICY "Users can view their own notifications"
-  ON notifications FOR SELECT USING (user_id = auth.uid());
-
-CREATE POLICY "Users can mark their notifications as read"
-  ON notifications FOR UPDATE
-  USING (user_id = auth.uid())
-  WITH CHECK (is_read = true);
-
--- ============================================================
--- FRAUD FLAGS RLS
--- ============================================================
--- Only admins (service role) can access fraud flags
--- No RLS policies granting access to regular users
+**Vault secret paths:**
+```
+secret/data/koinwork/firebase        → { project_id, client_email, private_key }
+secret/data/koinwork/razorpay        → { key_id, key_secret }
+secret/data/koinwork/cashfree        → { app_id, secret_key }
+secret/data/koinwork/cloudflare      → { zone_id, api_token }
+secret/data/koinwork/cloudwatch      → { access_key_id, secret_access_key }
 ```
 
 ---
 
-### 7.2 Rate Limiting Strategy
+### 7.3 Rate Limiting Strategy
 
-| Endpoint | Limit | Window | Storage |
-|----------|-------|--------|---------|
-| `apply-to-campaign` | 10 requests | 1 hour | Redis |
-| `process-withdrawal` | 3 requests | 24 hours | Redis |
-| `create-campaign` | 5 requests | 1 hour | Redis |
-| `checkin` / `checkout` | 10 requests | 1 hour | Redis |
-| Auth endpoints | 5 requests | 15 minutes | Supabase built-in |
+| Endpoint (Cloud Function) | Limit | Window | Storage |
+|--------------------------|-------|--------|---------|
+| `applyToCampaign` | 10 requests | 1 hour | Upstash Redis |
+| `processWithdrawal` | 3 requests | 24 hours | Redis |
+| `createCampaign` | 5 requests | 1 hour | Redis |
+| `checkIn` / `checkOut` | 10 requests | 1 hour | Redis |
+| Firebase Auth (login) | 5 attempts | 15 minutes | Firebase built-in |
+
+```typescript
+// Rate limiting via Upstash Redis (works in Cloud Functions)
+import { Ratelimit } from "@upstash/ratelimit";
+import { Redis } from "@upstash/redis";
+
+const ratelimit = new Ratelimit({
+  redis: Redis.fromEnv(),
+  limiter: Ratelimit.slidingWindow(10, "1 h"),
+});
+
+async function checkRateLimit(uid: string, action: string): Promise<void> {
+  const { success } = await ratelimit.limit(`${action}:${uid}`);
+  if (!success) throw new Error("Rate limit exceeded");
+}
+```
 
 ---
 
-### 7.3 KYC Integration Flow
+### 7.4 Cloudflare Security Layer
+
+```
+Browser → Cloudflare (WAF + DDoS protection) → Next.js on Vercel/Cloud Run
+```
+
+Cloudflare rules applied:
+- Block requests to `/api/auth/*` from non-Indian IPs (configurable)
+- Rate limit `/api/auth/session-login` to 5 req/min per IP
+- WAF rules: block SQL injection, XSS patterns
+- Bot Management: challenge suspicious traffic
+
+---
+
+### 7.5 AWS CloudWatch Monitoring
+
+```typescript
+// web/src/lib/monitoring/cloudwatch.ts
+import {
+  CloudWatchLogsClient,
+  PutLogEventsCommand,
+} from "@aws-sdk/client-cloudwatch-logs";
+
+const client = new CloudWatchLogsClient({ region: process.env.AWS_REGION! });
+
+export async function logEvent(
+  level: "INFO" | "WARN" | "ERROR",
+  message: string,
+  metadata?: Record<string, unknown>
+): Promise<void> {
+  await client.send(
+    new PutLogEventsCommand({
+      logGroupName:  process.env.CLOUDWATCH_LOG_GROUP!,
+      logStreamName: `koinwork-${new Date().toISOString().slice(0, 10)}`,
+      logEvents: [
+        {
+          timestamp: Date.now(),
+          message:   JSON.stringify({ level, message, ...metadata }),
+        },
+      ],
+    })
+  );
+}
+```
+
+**Alerts configured in CloudWatch:**
+- Wallet balance drops below 0 (should never happen) → PagerDuty
+- Error rate > 1% in Cloud Functions → Slack alert
+- Withdrawal processing queue > 100 pending → Slack alert
+
+---
+
+### 7.6 KYC Integration Flow
 
 ```
 Employee requests withdrawal
         ↓
-KYC status check
+KYC status check (Firestore: profiles/{uid}.kyc_status)
   ├─ NOT_SUBMITTED → Show KYC onboarding (Aadhaar/PAN upload)
   ├─ PENDING → "Your KYC is under review (1-2 business days)"
   ├─ REJECTED → "KYC rejected. Please re-submit with correct documents."
   └─ APPROVED → Proceed with withdrawal
         ↓
 KYC Provider (DigiLocker / Karza / Hyperverge)
-  └─ Webhook callback updates kyc_status in profiles table
-  └─ Notification sent to employee
+  └─ Webhook → Cloud Function updates kyc_status in Firestore
+  └─ Notification pushed to employee via FCM
 ```
 
 ---
 
-### 7.4 TDS Calculation Logic
+### 7.7 TDS Calculation Logic
 
 ```typescript
 const TDS_THRESHOLD_PAISA = 3_000_000; // ₹30,000 in paisa
-const TDS_RATE = 0.10; // 10% TDS under Section 194-O
+const TDS_RATE = 0.10;                 // 10% under Section 194-O
 
 async function calculateTDS(userId: string, withdrawalAmountPaisa: number): Promise<number> {
-  // Get total earnings in current financial year (April 1 to March 31)
   const fyStart = getFinancialYearStart(); // April 1 of current FY
 
-  const { data } = await supabase
-    .from('transactions')
-    .select('amount_paisa')
-    .eq('type', 'PAYMENT')
-    .eq('status', 'COMPLETED')
-    .gte('created_at', fyStart.toISOString())
-    .in('wallet_id', [await getWalletId(userId)]);
+  // Query earnings in current financial year from Firestore
+  const walletSnap = await db.collection("wallets")
+    .where("user_id", "==", userId).limit(1).get();
+  if (walletSnap.empty) return 0;
 
-  const yearlyEarningsPaisa = data?.reduce((sum, t) => sum + t.amount_paisa, 0) ?? 0;
+  const txSnap = await db.collection("transactions")
+    .where("wallet_id", "==", walletSnap.docs[0].id)
+    .where("type", "==", "PAYMENT")
+    .where("status", "==", "COMPLETED")
+    .where("created_at", ">=", fyStart)
+    .get();
+
+  const yearlyEarningsPaisa = txSnap.docs.reduce(
+    (sum, doc) => sum + doc.data().amount_paisa, 0
+  );
 
   if (yearlyEarningsPaisa >= TDS_THRESHOLD_PAISA) {
-    // Already crossed threshold — deduct TDS on entire withdrawal
     return Math.round(withdrawalAmountPaisa * TDS_RATE);
   }
 
-  const remainingBeforeThreshold = TDS_THRESHOLD_PAISA - yearlyEarningsPaisa;
+  const remaining = TDS_THRESHOLD_PAISA - yearlyEarningsPaisa;
+  if (withdrawalAmountPaisa <= remaining) return 0;
 
-  if (withdrawalAmountPaisa <= remainingBeforeThreshold) {
-    // Withdrawal keeps us under threshold — no TDS
-    return 0;
-  }
-
-  // Partial TDS on amount that crosses the threshold
-  const taxableAmount = withdrawalAmountPaisa - remainingBeforeThreshold;
-  return Math.round(taxableAmount * TDS_RATE);
+  return Math.round((withdrawalAmountPaisa - remaining) * TDS_RATE);
 }
 ```
 
 ---
 
-### 7.5 API Key Management
+### 7.8 API Key Management Rules
 
-- All Supabase service role keys live **only** in Edge Function environment variables
-- Client apps use only the **anon key** (public, safe to expose)
-- Razorpay keys: `RAZORPAY_KEY_ID` and `RAZORPAY_KEY_SECRET` in Edge Function env only
-- No secrets in frontend bundles or source control
-- Rotate service role key if compromised (Supabase Dashboard → Settings → API)
-- Use Vault for production secrets management
+- Firebase service account private key → HashiCorp Vault (`secret/data/koinwork/firebase`)
+- Firebase client config (API key etc.) → `.env.local` (safe: restricted to app domain in Firebase Console)
+- Razorpay/Cashfree keys → HashiCorp Vault only, never in source control
+- Cloudflare token → HashiCorp Vault
+- AWS CloudWatch credentials → AWS IAM role (no static keys preferred)
+- **Rule:** If a secret appears in a `.env` file in the repository, it is wrong
 
 ---
 
 ## 8. Scalability Plan
 
-### Database
+### Database (Firestore)
 
 | Concern | Solution |
 |---------|---------|
-| Feed query load | Read replicas for all SELECT queries on `campaigns` |
-| Connection exhaustion | Supavisor (Supabase connection pooler) in transaction mode |
-| Full table scans | PostGIS GiST index on all geography columns |
-| Slow aggregates | Materialized views refreshed every 5 min |
-| Write throughput | Separate write path (Edge Functions → primary DB) |
+| Feed query load | Firestore compound indexes; geohash proximity queries |
+| Proximity search | `geofire-common` geohash encoding (replaces PostGIS ST_DWithin) |
+| Slow aggregates | Firestore materialized counters (denormalized fields on campaign docs) |
+| Write throughput | Cloud Functions atomic Firestore transactions |
+| Offline support | Firestore offline persistence SDK (enabled on mobile) |
 
 ### Caching Strategy
 
 ```
-Layer 1: Materialized views (per-city feed, refreshed every 5 min)
-Layer 2: Upstash Redis (rate limit counters, session data, TTL: 1h-24h)
+Layer 1: Firestore offline cache (mobile — 10MB, auto-managed)
+Layer 2: Upstash Redis (rate limit counters, session data, TTL: 1h–24h)
 Layer 3: Next.js Edge Cache (static pages, feed skeleton, TTL: 60s)
-Layer 4: Supabase CDN (user avatars, campaign images, permanent cache)
+Layer 4: Firebase Storage + CDN (user avatars, campaign images, permanent cache)
 ```
 
 ### Realtime Scaling
 
 ```
-BEFORE: channel per campaign → O(campaigns) channels
-AFTER:  channel per city → O(cities) channels
+Firebase Realtime Database (for low-latency events):
+  /notifications/{uid}       — personal events (payment, approval, dispute)
+  /feed/{city}               — new OPEN campaigns in city
 
-Channel naming:
-  city:{city_id}:feed         — new OPEN campaigns in city
-  user:{user_id}:notifications — personal notifications (payments, approvals)
+Firestore listeners (for structured data):
+  campaigns collection       — feed with compound index
+  applications collection    — application status changes
 
-Events via Realtime (low volume, critical):
-  - Payment received
-  - Work approved/rejected
-  - Dispute update
-
-Events via polling (high volume, tolerant of delay):
+Polling fallback (high volume, tolerant of delay):
   - Feed refresh (poll every 60s with cache)
   - Application status (poll every 30s when active)
 ```
@@ -1957,95 +1667,92 @@ Events via polling (high volume, tolerant of delay):
 ### CDN & Storage
 
 ```
-Supabase Storage buckets:
-  - avatars/          (public, CDN-cached)
-  - campaign-images/  (public, CDN-cached)
-  - work-log-photos/  (private, signed URLs, 1h expiry)
-  - kyc-documents/    (private, service-role-only access)
+Firebase Storage buckets:
+  avatars/           (public CDN URL via Firebase Hosting)
+  campaign-images/   (public CDN)
+  work-log-photos/   (private, signed URLs, 1h expiry)
+  kyc-documents/     (private, admin-SDK-only access)
 ```
 
 ### Monitoring & Alerting
 
 | Tool | Purpose |
 |------|---------|
-| Sentry | Frontend/Edge Function error tracking |
-| Supabase Dashboard | Query performance, slow query log |
-| Upstash Console | Redis memory, rate limit hit rates |
+| AWS CloudWatch | Cloud Function logs, error metrics, custom dashboards |
+| Firebase Performance Monitoring | App startup time, Firestore query latency |
+| Upstash Console | Redis memory usage, rate limit hit rates |
+| Cloudflare Analytics | Request volume, WAF blocks, DDoS events |
 | Custom alerts | Fraud score spikes, escrow anomalies, withdrawal failures |
 
 ---
 
 ## 9. Development Phases (Updated)
 
-### Phase 1: Foundation (3–4 weeks)
-- Supabase project setup, PostGIS extension enabled
-- Auth flow: email, phone OTP, Google OAuth
+### Phase 1: Foundation (3–4 weeks) ✅ COMPLETE
+- Firebase project setup (Auth, Firestore, Storage, Cloud Functions)
+- Firestore security rules + composite indexes deployed
+- Auth flow: email/password, Google OAuth (Firebase Auth)
+- Session cookies: Firebase ID token → server-side session cookie
 - Role selection screen (Owner / Employee)
-- Profile setup with PostGIS location
-- Wallet table with integer math (paisa)
-- Transaction table with idempotency keys
-- RLS policies for: `profiles`, `wallets`, `transactions`
-- Basic Next.js layout + React Native Expo project scaffold
+- Profile setup (Firestore `profiles` collection)
+- Wallet document creation on profile save
+- Next.js App Router + TypeScript + Tailwind scaffold
+- Unit tests: currency utils (paisa/KCoin/TDS), geolocation utils (haversine, 200m geofence)
 
 ### Phase 2: Campaign System (3–4 weeks)
-- Campaign CRUD with PostGIS location picker
-- Per-slot escrow (campaign_slots table)
-- `create-campaign` Edge Function (atomic escrow freeze)
-- Campaign feed with PostGIS distance query + GiST index
-- Materialized view feed cache (per city, 5-min refresh)
+- Campaign CRUD with geohash location encoding
+- Per-slot escrow (`campaign_slots` Firestore collection)
+- `createCampaign` Cloud Function (atomic escrow freeze)
+- Campaign feed with geohash proximity query
+- Redis feed cache (per city, 5-min refresh via scheduled CF)
 - Campaign detail page
-- Campaign templates (save/reuse)
-- RLS for: `campaigns`, `campaign_slots`
+- Campaign templates (Firestore `campaign_templates` subcollection)
 
 ### Phase 3: Work Management (3–4 weeks)
-- Application flow with rate limiting (`apply-to-campaign` Edge Function)
+- Application flow with rate limiting (`applyToCampaign` CF)
 - Application status tracking (Owner accept/reject)
-- Geofenced check-in (200m radius, GPS validation)
+- Geofenced check-in (200m radius, GPS validation in CF)
 - Work log creation with anomaly flagging
 - Checkout with shift duration validation (4h min, 16h max)
 - Batch approval queue UI (Owner side, anomaly highlighted)
-- `approve-work` Edge Function (server-side geofence + escrow release)
-- Auto-release cron job (`auto-release-escrow`, 48h no-show)
-- RLS for: `applications`, `work_logs`
+- `approveWork` Cloud Function (server-side geofence + escrow release)
+- Auto-release scheduled function (`autoReleaseEscrow`, 48h no-show)
 
 ### Phase 4: Payments & Compliance (3–4 weeks)
 - Razorpay integration for wallet top-up (webhook + idempotency)
-- KYC onboarding flow (document upload, provider integration)
-- `process-withdrawal` Edge Function (KYC gate + TDS + freeze)
-- Razorpay Payout API for bank transfers
-- Withdrawal webhook handler (PROCESSING → COMPLETED / FAILED)
+- Cashfree Payouts for bank transfers to employees
+- KYC onboarding flow (document upload to Firebase Storage)
+- `processWithdrawal` Cloud Function (KYC gate + TDS + freeze)
+- Withdrawal webhook handler (PENDING → COMPLETED / FAILED)
 - TDS calculation and certificate generation
-- Fraud detection (`fraud-check` Edge Function, scoring model)
-- `fraud_flags` table + admin review queue
-- RLS for: `withdrawals`, `fraud_flags`
+- Fraud detection Cloud Function (`fraudCheck`, scoring model)
+- HashiCorp Vault integration for Razorpay/Cashfree secrets
 
 ### Phase 5: Growth Features (2–3 weeks)
 - Boost system: BASIC / STANDARD / PREMIUM tiers
-- `boost-campaign` Edge Function
+- `boostCampaign` Cloud Function
 - Feed score algorithm v2 (distance + pay + recency + boost + affinity)
 - Worker reviews with rating decay
 - Category affinity tracking
 - Campaign analytics for owners (fill rate, avg rating, cost per hire)
-- Notification system (in-app, push via Expo)
-- RLS for: `boost_purchases`, `reviews`, `notifications`
+- Notification system (in-app via Firestore, push via FCM)
 
 ### Phase 6: Mobile (4–5 weeks)
 - React Native screens mirroring web (feed, detail, apply, work, wallet)
-- Offline mode: cache recent feed + active campaign data locally
+- Offline mode: Firestore offline persistence SDK (auto-managed)
 - GPS background tracking during active shift
-- Push notifications (Expo Notifications + Supabase webhook triggers)
-- Multi-language: Hindi + 3 regional languages (i18n setup)
-- Biometric auth (Face ID / fingerprint)
+- Push notifications via FCM (Firebase Cloud Messaging)
+- Multi-language: Hindi + 3 regional languages (i18n)
+- Biometric auth (Face ID / fingerprint via Expo LocalAuthentication)
 
 ### Phase 7: Admin & Operations (3–4 weeks)
-- Admin panel (Next.js, service-role protected)
-- Dispute resolution workflow: `disputes` table + admin UI
-- `settle-campaign` Edge Function (end-of-campaign settlement)
+- Admin panel (Next.js, Firebase Admin SDK, `admin: true` custom claim)
+- Dispute resolution workflow (`disputes` collection + admin UI)
+- `settleCampaign` Cloud Function (end-of-campaign settlement)
 - Analytics dashboard (daily active users, GMV, fill rates, fraud incidents)
-- Surge pricing suggestions (show demand signals to owners)
-- Monitoring integration: Sentry, Supabase Dashboard alerts, Upstash
+- Surge pricing suggestions (demand signals to owners)
+- Monitoring: CloudWatch dashboards, Firebase Performance, Cloudflare analytics
 - Compliance reporting (TDS certificates, transaction exports)
-- RLS for: `disputes`
 
 ---
 
@@ -2054,106 +1761,90 @@ Supabase Storage buckets:
 ```
 ## 📋 Implementation Status
 
-### Phase 1: Foundation
-- [ ] Supabase project created and configured
-- [ ] PostGIS extension enabled
-- [ ] Auth flow: email/password
-- [ ] Auth flow: phone OTP
-- [ ] Auth flow: Google OAuth
-- [ ] Role selection screen (Owner / Employee)
-- [ ] Profile creation (name, phone, avatar)
-- [ ] Profile location setup (PostGIS geography point)
-- [ ] GiST index on profiles.location
-- [ ] Wallet table created (available_balance + frozen_balance in paisa)
-- [ ] Wallet auto-created on profile creation (trigger)
-- [ ] Transactions table with idempotency_key
-- [ ] RLS policies: profiles (SELECT all, UPDATE own, INSERT own)
-- [ ] RLS policies: wallets (SELECT own only)
-- [ ] RLS policies: transactions (SELECT own only)
-- [ ] update_updated_at trigger on all tables
-- [ ] Next.js project scaffolded (App Router)
+### Phase 1: Foundation ✅ COMPLETE
+- [x] Firebase project setup (Auth, Firestore, Cloud Functions)
+- [x] Auth flow: email/password (Firebase Auth)
+- [ ] Auth flow: phone OTP (Firebase Auth)
+- [x] Auth flow: Google OAuth (Firebase Auth)
+- [x] Session cookie: ID token → httpOnly server-side cookie
+- [x] Next.js proxy.ts: protect routes with session cookie
+- [x] Role selection screen (Owner / Employee)
+- [x] Profile creation (name, phone, city/state, bio) → Firestore
+- [x] Wallet document auto-created on profile setup
+- [x] Transactions collection with idempotency_key
+- [x] Firestore security rules (profiles, wallets, transactions, campaigns, etc.)
+- [x] Composite indexes (firestore.indexes.json)
+- [x] Next.js App Router scaffold (TypeScript + Tailwind)
+- [x] Unit tests: currency utils (paisa/KCoin/TDS) — 35 tests
+- [x] Unit tests: geolocation utils (haversine, geofence, shift duration) — 16 tests
+- [x] .env.example (Firebase + Razorpay + Cashfree + Vault + CloudWatch + Cloudflare)
 - [ ] React Native + Expo project scaffolded
 - [ ] Shared TypeScript types package
 
 ### Phase 2: Campaign System
-- [ ] campaigns table with PostGIS location and all indexes
-- [ ] campaign_slots table (per-slot escrow)
-- [ ] create-campaign Edge Function (atomic escrow freeze)
+- [ ] campaigns Firestore collection with geohash field
+- [ ] campaign_slots collection (per-slot escrow)
+- [ ] createCampaign Cloud Function (atomic escrow freeze)
 - [ ] Campaign creation UI (Owner) with map location picker
 - [ ] Campaign listing page (Owner)
-- [ ] PostGIS distance feed query with GiST index
-- [ ] Materialized view feed cache: Mumbai
-- [ ] Materialized view feed cache: Delhi
-- [ ] Materialized view feed cache: Bangalore
-- [ ] Cron job: refresh feed cache every 5 minutes
+- [ ] Geohash proximity feed query (geofire-common)
+- [ ] Redis feed cache (per city, 5-min refresh via scheduled CF)
 - [ ] Campaign feed page (Employee) with cursor-based pagination
 - [ ] Campaign detail page (Employee)
-- [ ] Campaign templates (save / load)
-- [ ] RLS policies: campaigns
-- [ ] RLS policies: campaign_slots
+- [ ] Campaign templates
 
 ### Phase 3: Work Management
-- [ ] applications table with rate-limit index
-- [ ] apply-to-campaign Edge Function (rate limit + duplicate check + slot check)
+- [ ] applications collection with rate-limit support
+- [ ] applyToCampaign Cloud Function (rate limit + duplicate check)
 - [ ] Application submission UI (Employee)
 - [ ] Application review UI (Owner: accept / reject)
-- [ ] Application status tracking (Employee)
-- [ ] work_logs table with all constraints
-- [ ] Geofenced check-in (200m radius GPS validation)
+- [ ] work_logs collection with geofence validation fields
+- [ ] Geofenced check-in (200m radius GPS in CF)
 - [ ] Check-in UI with map + GPS status
 - [ ] Checkout UI with shift timer
 - [ ] Anomaly flag computation on checkout
 - [ ] Batch approval queue UI (Owner, anomaly highlighted)
-- [ ] approve-work Edge Function (server-side validation + escrow release)
-- [ ] approve_work_atomic PL/pgSQL function
-- [ ] auto-release-escrow Edge Function (48-hour no-show cron)
-- [ ] Cron: auto-release-escrow every hour
-- [ ] RLS policies: applications
-- [ ] RLS policies: work_logs
+- [ ] approveWork Cloud Function (server-side validation + escrow release)
+- [ ] autoReleaseEscrow scheduled Cloud Function (48-hour no-show)
 
 ### Phase 4: Payments & Compliance
 - [ ] Razorpay SDK integration (wallet top-up)
 - [ ] Razorpay webhook handler (idempotency, DEPOSIT transaction)
-- [ ] KYC onboarding screen (document type, upload)
+- [ ] Cashfree Payouts integration (bank withdrawals)
+- [ ] KYC onboarding screen (document upload to Firebase Storage)
 - [ ] KYC provider integration (DigiLocker / Karza)
-- [ ] KYC webhook handler (status update)
-- [ ] withdrawals table + freeze trigger
-- [ ] process-withdrawal Edge Function (KYC gate + TDS + Razorpay Payout)
+- [ ] KYC webhook handler (status update in Firestore)
+- [ ] processWithdrawal Cloud Function (KYC gate + TDS + freeze)
 - [ ] Withdrawal UI (Employee) with TDS breakdown
-- [ ] Razorpay Payout webhook handler (PROCESSING → COMPLETED/FAILED)
-- [ ] TDS calculation function
-- [ ] fraud_flags table
-- [ ] fraud-check Edge Function (scoring model)
+- [ ] Cashfree Payout webhook handler (PROCESSING → COMPLETED/FAILED)
+- [ ] TDS calculation in Cloud Function
+- [ ] HashiCorp Vault integration for payment secrets
+- [ ] fraud_flags collection
+- [ ] fraudCheck Cloud Function (scoring model)
 - [ ] Fraud review queue (Admin)
-- [ ] RLS policies: withdrawals
-- [ ] RLS policies: fraud_flags
 
 ### Phase 5: Growth Features
-- [ ] boost_purchases table
-- [ ] boost-campaign Edge Function (tier validation + wallet debit)
+- [ ] boost_purchases collection
+- [ ] boostCampaign Cloud Function (tier validation + wallet debit)
 - [ ] Boost UI (Owner: tier selector)
-- [ ] Feed score algorithm v2 (all signals implemented)
-- [ ] Boost multiplier applied to feed score
-- [ ] reviews table
-- [ ] Review submission UI (post-campaign, both roles)
-- [ ] Rating decay algorithm (older reviews weighted less)
-- [ ] Category affinity tracking query
+- [ ] Feed score algorithm v2 (all signals)
+- [ ] Worker reviews collection with rating decay
+- [ ] Category affinity tracking
 - [ ] Campaign analytics page (Owner)
-- [ ] notifications table
+- [ ] notifications collection (Firestore)
 - [ ] In-app notification bell + list
-- [ ] Push notification setup (Expo)
-- [ ] RLS policies: boost_purchases, reviews, notifications
+- [ ] Push notifications (FCM — Firebase Cloud Messaging)
 
 ### Phase 6: Mobile
+- [ ] React Native Expo project
 - [ ] Mobile feed screen (geo-indexed, cached)
 - [ ] Mobile campaign detail screen
 - [ ] Mobile application flow (rate-limited)
-- [ ] Mobile geofenced check-in (GPS background)
+- [ ] Mobile geofenced check-in (GPS)
 - [ ] Mobile wallet screen
 - [ ] Mobile withdrawal screen
-- [ ] Offline mode: cache feed and active campaign
-- [ ] Service worker / local storage strategy
-- [ ] Push notifications (Expo Notifications)
+- [ ] Offline mode (Firestore offline persistence SDK)
+- [ ] Push notifications (FCM + Expo)
 - [ ] Multi-language: English
 - [ ] Multi-language: Hindi
 - [ ] Multi-language: Marathi
@@ -2162,23 +1853,21 @@ Supabase Storage buckets:
 - [ ] Biometric auth (Face ID / fingerprint)
 
 ### Phase 7: Admin & Operations
-- [ ] Admin panel (service-role protected)
-- [ ] disputes table
+- [ ] Admin panel (Firebase Admin SDK, custom claim `admin: true`)
+- [ ] disputes collection
 - [ ] Dispute submission UI (Owner and Employee)
 - [ ] Dispute review UI (Admin)
-- [ ] settle-campaign Edge Function (end-of-campaign settlement)
-- [ ] Dispute lifecycle state machine (OPEN → CLOSED)
+- [ ] settleCampaign Cloud Function (end-of-campaign settlement)
 - [ ] Analytics dashboard (DAU, GMV, fill rate, fraud)
 - [ ] TDS report export
 - [ ] Transaction export (CSV)
-- [ ] Sentry integration (web + mobile)
+- [ ] CloudWatch dashboards (error rate, withdrawal queue, wallet anomalies)
+- [ ] Cloudflare WAF rules hardened
 - [ ] Custom alert: fraud score spike
 - [ ] Custom alert: escrow anomaly
 - [ ] Custom alert: high withdrawal failure rate
-- [ ] Surge pricing suggestion feature
-- [ ] RLS policies: disputes
 - [ ] Load testing (k6 or Artillery)
-- [ ] Security audit (manual RLS policy review)
+- [ ] Security audit (Firestore rules review, CF input validation)
 - [ ] Production deployment checklist
 ```
 
@@ -2195,37 +1884,38 @@ Supabase Storage buckets:
 - Use `Math.round()` for any division result before storing.
 
 ### Location
-- **ALL distance calculations via PostGIS** — never in JavaScript/TypeScript application code.
-- Store locations as `geography(Point, 4326)` — SRID 4326 (WGS84, standard GPS).
-- Always create a GiST index on geography columns.
+- **ALL distance calculations via geohash (geofire-common)** on server; haversine in client utilities for display only.
+- Store locations as `lat` + `lng` (decimal degrees) + `geohash` (string) in Firestore.
+- Geofence validation (check-in 200m radius) enforced server-side in Cloud Functions.
 
 ### Financial Operations
-- **ALL financial calculations server-side only** (Edge Functions + PL/pgSQL).
-- Client sends: intent + IDs. Server computes: amounts.
-- Every payment-related DB operation uses **idempotency keys** (`ON CONFLICT (idempotency_key) DO NOTHING`).
-- Wallet mutations use `SELECT ... FOR UPDATE` to prevent race conditions.
+- **ALL financial calculations server-side only** (Cloud Functions).
+- Client sends: intent + document IDs. Server computes: amounts.
+- Every payment-related Firestore write uses **idempotency keys** (query before write).
+- Wallet mutations use `db.runTransaction()` to prevent race conditions.
 
 ### Security
-- **ALL tables have RLS enabled** (`ALTER TABLE x ENABLE ROW LEVEL SECURITY`).
-- No table is accessible without an explicit RLS policy.
-- Rate limiting on ALL user-facing Edge Function endpoints (Redis-backed).
+- **ALL Firestore collections have security rules** — deny by default, explicit allow.
+- No collection is readable/writable without an explicit security rule.
+- Rate limiting on ALL user-facing Cloud Function endpoints (Upstash Redis).
 - Fraud scoring runs on every withdrawal request.
 - KYC required before first withdrawal.
+- All production secrets in HashiCorp Vault — never in source control.
 
 ### Code Style
 - TypeScript strict mode everywhere.
 - No `any` types in financial or auth-related code.
-- Edge Functions: validate all inputs at the top with early returns.
-- DB functions: `SECURITY DEFINER` for all financial PL/pgSQL functions.
+- Cloud Functions: validate all inputs at the top with early returns.
 - All currency-related variable names end in `_paisa` (e.g., `amount_paisa`, `cost_paisa`).
+- Firebase Admin imports: only in `@/lib/firebase/admin.ts` and Cloud Functions (never client components).
 
 ### Git & Development
 - Branch naming: `feature/phase-N-description`, `fix/issue-description`
 - Never commit secrets. Use `.env.local` for local development.
 - Consult this file (`KOINWORK_BLUEPRINT.md`) **before starting any task**.
 - Update the [status checklist](#10-checklist--status-tracker) as items are completed.
-- Edge Function changes require a corresponding RLS policy audit.
+- Cloud Function changes require a corresponding Firestore security rules audit.
 
 ---
 
-*Last updated: 2026-02-20 | Blueprint version: 1.0*
+*Last updated: 2026-03-03 | Blueprint version: 2.0 (Firebase migration)*

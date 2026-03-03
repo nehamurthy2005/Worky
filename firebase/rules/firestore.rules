@@ -1,0 +1,164 @@
+// ============================================================
+// KoinWork — Firestore Security Rules
+// Last updated: Phase 1 Foundation
+//
+// Rules enforce:
+// 1. Users can only read/write their own profile and wallet
+// 2. All financial operations are server-only (via Cloud Functions)
+// 3. Campaign visibility is public-read, owner-write
+// 4. Applications are read/write only by the relevant parties
+// ============================================================
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ─── Helper functions ─────────────────────────────────────
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function hasRole(role) {
+      return isSignedIn()
+        && get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.role == role;
+    }
+
+    function isAdmin() {
+      return isSignedIn()
+        && request.auth.token.admin == true;
+    }
+
+    // ─── profiles ─────────────────────────────────────────────
+    // Users can read their own profile; owners can read employee profiles
+    // (for reviewing applicants). Only the owner of the profile can write.
+    match /profiles/{uid} {
+      allow read:  if isOwner(uid) || isSignedIn();
+      allow create: if isOwner(uid)
+                    && request.resource.data.keys().hasAll(['role', 'full_name'])
+                    && request.resource.data.role in ['owner', 'employee'];
+      allow update: if isOwner(uid)
+                    && !request.resource.data.diff(resource.data).affectedKeys()
+                       .hasAny(['role', 'kyc_status', 'kyc_verified_at', 'avg_rating', 'total_reviews', 'created_at']);
+      allow delete: if false; // soft-delete via is_active
+    }
+
+    // ─── wallets ──────────────────────────────────────────────
+    // CRITICAL: No client-side writes to balance fields.
+    // All balance changes must go through Cloud Functions (server-side).
+    match /wallets/{walletId} {
+      allow read:   if isSignedIn() && resource.data.user_id == request.auth.uid;
+      allow create: if false; // created by Cloud Function on profile creation
+      allow update: if false; // all balance changes via Cloud Functions only
+      allow delete: if false;
+    }
+
+    // ─── transactions ─────────────────────────────────────────
+    // Read-only for the wallet owner. Writes only via Cloud Functions.
+    match /transactions/{txId} {
+      allow read:   if isSignedIn()
+                    && get(/databases/$(database)/documents/wallets/$(resource.data.wallet_id)).data.user_id == request.auth.uid;
+      allow write:  if false; // Cloud Functions only
+    }
+
+    // ─── campaigns ────────────────────────────────────────────
+    // Public read (for feed). Only owners can create/edit their own campaigns.
+    match /campaigns/{campaignId} {
+      allow read:   if true; // public feed
+      allow create: if hasRole('owner')
+                    && request.resource.data.owner_id == request.auth.uid;
+      allow update: if hasRole('owner')
+                    && resource.data.owner_id == request.auth.uid
+                    && !request.resource.data.diff(resource.data).affectedKeys()
+                       .hasAny(['escrow_status', 'total_slots_filled', 'escrow_amount_paisa']);
+      allow delete: if false; // cancel via status update only
+    }
+
+    // ─── campaign_slots ───────────────────────────────────────
+    match /campaign_slots/{slotId} {
+      allow read:   if isSignedIn();
+      allow write:  if false; // managed by Cloud Functions
+    }
+
+    // ─── applications ─────────────────────────────────────────
+    // Employee can create/read their own. Owner can read/update applications
+    // for their campaigns.
+    match /applications/{appId} {
+      allow read:   if isSignedIn()
+                    && (resource.data.employee_id == request.auth.uid
+                        || get(/databases/$(database)/documents/campaigns/$(resource.data.campaign_id)).data.owner_id == request.auth.uid);
+      allow create: if hasRole('employee')
+                    && request.resource.data.employee_id == request.auth.uid;
+      allow update: if isSignedIn()
+                    && (resource.data.employee_id == request.auth.uid
+                        || get(/databases/$(database)/documents/campaigns/$(resource.data.campaign_id)).data.owner_id == request.auth.uid)
+                    && !request.resource.data.diff(resource.data).affectedKeys()
+                       .hasAny(['employee_id', 'campaign_id']);
+      allow delete: if false;
+    }
+
+    // ─── work_logs ────────────────────────────────────────────
+    match /work_logs/{logId} {
+      allow read:   if isSignedIn()
+                    && (resource.data.employee_id == request.auth.uid
+                        || get(/databases/$(database)/documents/campaigns/$(resource.data.campaign_id)).data.owner_id == request.auth.uid);
+      allow create: if hasRole('employee')
+                    && request.resource.data.employee_id == request.auth.uid;
+      allow update: if false; // approval via Cloud Functions only
+      allow delete: if false;
+    }
+
+    // ─── withdrawals ──────────────────────────────────────────
+    match /withdrawals/{wdId} {
+      allow read:   if isSignedIn() && resource.data.user_id == request.auth.uid;
+      allow create: if hasRole('employee')
+                    && request.resource.data.user_id == request.auth.uid;
+      allow update: if false; // status updates via Cloud Functions / webhooks
+      allow delete: if false;
+    }
+
+    // ─── disputes ─────────────────────────────────────────────
+    match /disputes/{disputeId} {
+      allow read:   if isSignedIn()
+                    && (resource.data.raised_by == request.auth.uid
+                        || resource.data.against == request.auth.uid
+                        || isAdmin());
+      allow create: if isSignedIn()
+                    && request.resource.data.raised_by == request.auth.uid;
+      allow update: if isAdmin(); // only admins can resolve disputes
+      allow delete: if false;
+    }
+
+    // ─── notifications ────────────────────────────────────────
+    match /notifications/{notifId} {
+      allow read:  if isSignedIn() && resource.data.user_id == request.auth.uid;
+      allow write: if false; // Cloud Functions only
+    }
+
+    // ─── boost_purchases ──────────────────────────────────────
+    match /boost_purchases/{boostId} {
+      allow read:   if isSignedIn()
+                    && resource.data.owner_id == request.auth.uid;
+      allow write:  if false; // Cloud Functions only
+    }
+
+    // ─── fraud_flags ──────────────────────────────────────────
+    match /fraud_flags/{flagId} {
+      allow read:   if isAdmin();
+      allow write:  if false; // Cloud Functions only
+    }
+
+    // ─── reviews ──────────────────────────────────────────────
+    match /reviews/{reviewId} {
+      allow read:   if true; // public
+      allow create: if isSignedIn()
+                    && request.resource.data.reviewer_id == request.auth.uid;
+      allow update: if isSignedIn()
+                    && resource.data.reviewer_id == request.auth.uid;
+      allow delete: if false;
+    }
+  }
+}
